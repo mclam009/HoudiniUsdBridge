@@ -500,12 +500,13 @@ TfTokenVector
 XUSD_ViewerDelegate::GetMaterialRenderContexts() const
 {
     static const TfToken theMtlxToken("mtlx", TfToken::Immortal);
-    static int theUseMtlx(UT_EnvControl::getInt(ENV_HOUDINI_GL_USE_MATERIALX));
+    static const TfToken theUniversalToken("", TfToken::Immortal);
 
+    static int theUseMtlx(UT_EnvControl::getInt(ENV_HOUDINI_GL_USE_MATERIALX));
     if(theUseMtlx != 0)
         return { theMtlxToken };
     else
-        return { };
+        return { theUniversalToken }; // Just the universal preview shaders.
 }
 
 
