@@ -89,6 +89,133 @@ houLoader()
     return theLoader;
 }
 
+// Simple GU_Detail cache to prevent multiple file opens on a volume containing
+// multiple fields
+class DetailCache
+{
+public:
+    struct Item
+    {
+        Item()
+        : myCounter(0)
+        {
+        }
+        GU_DetailHandle  myDetail;
+        // A dedicated counter for the field prims referencing the file. Don't
+        // use the refcount in detail handle because it's referenced by the
+        // primitives which are also referenced by BRAY, so we wouldn't know if
+        // we need to let go until the next render.
+        int              myCounter;
+    };
+
+    GU_ConstDetailHandle get(const UT_StringHolder &filename)
+    {
+        // NOTE that this prevents concurrent loads, though that's fine (for
+        // now) since Bprims aren't synced concurrently anyways.
+        UT_Lock::Scope lock(myLock);
+        Item &item = myMap[filename];
+        item.myCounter++;
+        if (!item.myDetail)
+        {
+            item.myDetail.allocateAndSet(new GU_Detail());
+            if (!item.myDetail.gdpNC()->load(filename.c_str()))
+                item.myDetail.deleteGdp();
+        }
+        return item.myDetail;
+    }
+
+    void release(const UT_StringHolder &filename)
+    {
+        UT_Lock::Scope lock(myLock);
+        UT_Map<UT_StringHolder, Item>::iterator it = myMap.find(filename);
+        if (it != myMap.end())
+        {
+            Item &item = it->second;
+            item.myCounter--;
+            if (!item.myCounter)
+                myMap.erase(filename);
+        }
+    }
+
+    UT_Map<UT_StringHolder, Item>   myMap;
+    UT_Lock myLock;
+};
+
+static DetailCache &
+detailCache()
+{
+    static DetailCache theCache;
+    return theCache;
+}
+
+// Pull specific field from detail
+template <bool NATIVE>
+GT_PrimitiveHandle
+getVolumePrimitiveFromDetail(
+    GU_ConstDetailHandle &gdh,
+    const UT_StringRef &fieldname,
+    int fieldindex)
+{
+    if (gdh)
+    {
+        GU_DetailHandleAutoReadLock	 lock(gdh);
+        const GU_Detail *gdp = lock.getGdp();
+
+        if (gdp)
+        {
+            const GEO_Primitive	*geoprim = nullptr;
+            GA_Offset field_offset = GA_INVALID_OFFSET;
+
+            // For Houdini volumes, the field index is the primary identifier,
+            // and has no need to use the name.
+            if (field_offset == GA_INVALID_OFFSET && NATIVE &&
+                fieldindex < gdp->getNumPrimitives())
+            {
+                field_offset = gdp->primitiveOffset(GA_Index(fieldindex));
+            }
+
+            if (field_offset == GA_INVALID_OFFSET && fieldname.isstring())
+            {
+                // Look for VDB volumes by default, Houdini volumes if
+                // the fieldtype indicates a Houdini volume.
+                GA_PrimCompat::TypeMask primtype;
+                if (NATIVE)
+                    primtype = GEO_PrimTypeCompat::GEOPRIMVOLUME;
+                else
+                    primtype = GEO_PrimTypeCompat::GEOPRIMVDB;
+
+                // For Houdini volumes, always use the first name match (the
+                // field index, if it exists, is a prim number, not a match
+                // number). For other volume types the field index is the
+                // match number.
+                int matchnumber = 0;
+                if (!NATIVE)
+                    matchnumber = (fieldindex >= 0 ? fieldindex : 0);
+
+                const GEO_Primitive *prim = gdp->findPrimitiveByName(
+                    fieldname, primtype, "name", matchnumber);
+                if (prim)
+                    field_offset = prim->getMapOffset();
+            }
+
+            if (field_offset != GA_INVALID_OFFSET)
+                geoprim = gdp->getGEOPrimitive(field_offset);
+
+            if (geoprim && geoprim->getTypeId().get() == GEO_PRIMVDB)
+            {
+                return UTmakeIntrusive<GT_PrimVDB>(gdh, geoprim);
+            }
+            else if (geoprim && geoprim->getTypeId().get() == GEO_PRIMVOLUME)
+            {
+                return UTmakeIntrusive<GT_PrimVolume>(gdh, geoprim,
+                    GT_DataArrayHandle());
+            }
+        }
+    }
+
+    return nullptr;
+}
+
 }//ns
 
 BRAY_HdField::BRAY_HdField(const TfToken& typeId, const SdfPath& primId)
@@ -129,6 +256,8 @@ BRAY_HdField::Sync(HdSceneDelegate *sceneDelegate,
 
     if (*dirtyBits & DirtyParams)
     {
+        detailCache().release(myFilePath);
+
 	SdfAssetPath	filePath;
 	TfToken		fieldName;
 	int		fieldIdx;
@@ -164,6 +293,7 @@ BRAY_HdField::Sync(HdSceneDelegate *sceneDelegate,
 void
 BRAY_HdField::Finalize(HdRenderParam *renderParam)
 {
+    detailCache().release(myFilePath);
 }
 
 bool
@@ -189,13 +319,40 @@ BRAY_HdField::updateGTPrimitive()
 	return;
     }
 
-    GT_Primitive        *gt = nullptr;
-    if (myFieldType == BRAYHdTokens->bprimHoudiniFieldAsset)
-        gt = houLoader().hou(myFilePath, myFieldName, myFieldIdx);
-    else if (myFieldType == BRAYHdTokens->openvdbAsset)
-        gt = houLoader().vdb(myFilePath, myFieldName, myFieldIdx);
-    UT_ASSERT(gt);
-    myField.reset(gt);
+    SdfFileFormat::FileFormatArguments	 args;
+    std::string				 path;
+    SdfLayer::SplitIdentifier(myFilePath.toStdString(), &path, &args);
+
+    // ".volumes" from HUSD_Constants::getVolumeSopSuffix()
+    if (myFilePath.startsWith("op:")
+        || myFilePath.startsWith("hda:")
+        || UT_StringRef(path).endsWith(".volumes"))
+    {
+        // load from SOP or packed disk
+        GT_Primitive        *gt = nullptr;
+        if (myFieldType == BRAYHdTokens->bprimHoudiniFieldAsset)
+            gt = houLoader().hou(myFilePath, myFieldName, myFieldIdx);
+        else if (myFieldType == BRAYHdTokens->openvdbAsset)
+            gt = houLoader().vdb(myFilePath, myFieldName, myFieldIdx);
+
+        UT_ASSERT(gt);
+        myField.reset(gt);
+    }
+    else
+    {
+        // load from file
+        GU_ConstDetailHandle gdh = detailCache().get(myFilePath);
+        if (myFieldType == BRAYHdTokens->bprimHoudiniFieldAsset)
+        {
+            myField = getVolumePrimitiveFromDetail<true>(gdh, myFieldName,
+                myFieldIdx);
+        }
+        else if (myFieldType == BRAYHdTokens->openvdbAsset)
+        {
+            myField = getVolumePrimitiveFromDetail<false>(gdh, myFieldName,
+                myFieldIdx);
+        }
+    }
 }
 
 void
